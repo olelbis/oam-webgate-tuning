@@ -1,60 +1,78 @@
 # oam-webgate-tuning
 
-Calcolatore di tuning per **Oracle Access Manager (OAM) WebGate** su Apache HTTP Server / Oracle HTTP Server con MPM **worker** o **event**.
+A tuning calculator for **Oracle Access Manager (OAM) WebGate** running on Apache HTTP Server / Oracle HTTP Server with the **worker** or **event** MPM.
 
-Dato il blocco MPM del web server e la topologia (numero di web server in farm, numero di Access Server primari/secondari), lo script calcola i valori suggeriti per il profilo WebGate — *Max Number of Connections*, *Max Connections*, *Failover Threshold*, *AAA Timeout Threshold* — e proietta il numero di connessioni OAP risultanti su ogni Access Server, segnalando incoerenze e valori a rischio.
+Given the MPM block of your web server and your topology (number of web servers in the farm, number of primary/secondary Access Servers), the script computes the suggested values for the WebGate profile — *Max Number of Connections*, *Max Connections*, *Failover Threshold*, *AAA Timeout Threshold* — and projects the resulting number of OAP connections landing on each Access Server, flagging inconsistencies and risky values.
 
 ```bash
 python3 webgate_tuning.py --conf /etc/httpd/conf/httpd.conf --webservers 5 --oam-primary 8
 ```
 
-Nessuna dipendenza: solo Python 3 standard library.
+No dependencies: Python 3 standard library only.
 
-## Origine del calcolo
+## Where the calculation comes from
 
-La logica deriva dall'articolo dell'Oracle A-Team **"OAM 11g Webgate Tuning"** (fusionsecurity.blogspot.com, 2016), il riferimento classico sul dimensionamento dei WebGate. I principi chiave che l'articolo stabilisce, e che questo script automatizza, sono tre:
+The logic is based on the Oracle A-Team article **"OAM 11g Webgate Tuning"** (fusionsecurity.blogspot.com, 2016), the classic reference on WebGate sizing. The article establishes three key principles, which this script automates:
 
-**1. Il WebGate vive nei processi child, non nei thread.** Con gli MPM worker/event, Apache è composto da un processo padre e da N processi child, ognuno dei quali contiene `ThreadsPerChild` thread. Il modulo WebGate viene istanziato **una volta per ogni child**: è il child ad aprire il proprio pool di connessioni OAP verso gli Access Server, e i suoi thread condividono quel pool. Il moltiplicatore delle connessioni è quindi il numero di child, non il numero di thread.
+**1. The WebGate lives in child processes, not in threads.** With the worker/event MPMs, Apache consists of one parent process and N child processes, each containing `ThreadsPerChild` threads. The WebGate module is instantiated **once per child**: it is the child that opens its own pool of OAP connections to the Access Servers, and its threads *share* that pool. The connection multiplier is therefore the number of children — not the number of threads.
 
-**2. "Max Connections" è la somma dei soli primari.** Nel profilo WebGate, il parametro *Max Number of Connections* si imposta per singolo Access Server; il parametro aggregato *Max Connections* deve essere pari alla somma dei *Max Number of Connections* dei soli server **primari** (i secondari sono esclusi dal conteggio: entrano in gioco solo in failover).
+**2. "Max Connections" is the sum of primaries only.** In the WebGate profile, *Max Number of Connections* is set per individual Access Server; the aggregate parameter *Max Connections* must equal the sum of the *Max Number of Connections* of the **primary** servers only (secondaries are excluded from the count: they only come into play on failover).
 
-**3. "A little goes a long way."** Poiché ogni unità di *Max Number of Connections* viene moltiplicata per il numero di child e per il numero di web server della farm, valori piccoli (tipicamente 1) sono quasi sempre sufficienti; valori generosi saturano gli Access Server. L'articolo raccomanda inoltre di non lasciare mai *AAA Timeout Threshold* a `-1` (che delega al timeout TCP dell'OS, spesso oltre 2 minuti) ma di impostarlo a pochi secondi, e — in presenza di secondari — di porre *Failover Threshold* pari a *Max Number of Connections*.
+**3. "A little goes a long way."** Since every unit of *Max Number of Connections* gets multiplied by the number of children and by the number of web servers in the farm, small values (typically 1) are almost always enough; generous values saturate the Access Servers. The article also recommends never leaving *AAA Timeout Threshold* at `-1` (which delegates to the OS TCP timeout, often 2+ minutes) but setting it to a few seconds, and — when secondaries exist — setting *Failover Threshold* equal to *Max Number of Connections*.
 
-## Come si ottiene il risultato finale
+## How the final result is obtained, step by step
 
-### Passo 1 — Child massimi del web server
+The whole calculation fits in four small steps. Follow them once with the worked example below and it will click.
 
-Dal blocco MPM si ricava quanti processi child Apache può generare:
+### Step 0 — What we start from
 
-```
-child_max = min( MaxClients / ThreadsPerChild , ServerLimit )
-```
+Two inputs:
 
-`MaxClients` (o `MaxRequestWorkers` in Apache 2.4) è il totale dei thread serventi; diviso per `ThreadsPerChild` dà i child necessari a raggiungerlo. `ServerLimit` è il tetto rigido: se è inferiore al rapporto, i thread effettivi si fermano prima (lo script lo segnala come avvertenza).
+1. **The MPM block** of your Apache/OHS (`httpd.conf`), which tells us how big the web server can grow.
+2. **The topology**: how many web servers sit in the farm, and how many OAM Access Servers they talk to.
 
-### Passo 2 — Profilo WebGate
+### Step 1 — How many child processes can Apache create?
 
-```
-Max Connections     = conn_per_oam × numero_primari
-Failover Threshold  = conn_per_oam   (se esistono secondari; altrimenti 1, inerte)
-AAA Timeout         = 5 secondi
-```
+Apache serves traffic with *child processes*, each carrying `ThreadsPerChild` threads. Two directives cap the children:
 
-dove `conn_per_oam` è il *Max Number of Connections* scelto per ciascun Access Server (default: **1**).
+- `MaxClients` (renamed `MaxRequestWorkers` in Apache 2.4) caps the **total number of threads**. Dividing it by `ThreadsPerChild` tells you how many children are needed to reach it.
+- `ServerLimit` is a **hard ceiling on the number of children**, full stop.
 
-### Passo 3 — Proiezione delle connessioni OAP
+Apache obeys whichever is lower:
 
 ```
-conn_per_webserver  = Max Connections × child_max
-conn_totali_farm    = conn_per_webserver × numero_webserver
-conn_per_AccessServer = conn_per_oam × child_max × numero_webserver
+max_children = min( MaxClients / ThreadsPerChild , ServerLimit )
 ```
 
-L'ultimo valore è quello da confrontare con la capacità degli Access Server: lo script avvisa oltre le 300 connessioni per AS e marca come critico oltre le 800 (soglie indicative, configurabili in testa al file: `WARN_CONN_PER_AS`, `CRIT_CONN_PER_AS` — la parola finale ce l'ha sempre il load test).
+Why we care: **each child runs its own copy of the WebGate**, and each copy opens its own connections to OAM. So `max_children` is *the* multiplier of the whole story. (If `ServerLimit` is the lower one, your real thread capacity is lower than `MaxClients` says — the script warns you about that.)
 
-### Esempio svolto
+### Step 2 — Choose the per-server connection count
 
-Con il file di esempio in `examples/httpd.conf.sample`:
+Pick how many OAP connections each WebGate copy should hold open **towards each single Access Server**. This is the WebGate parameter *Max Number of Connections*. Default and recommended starting point: **1**. Resist the urge to raise it — remember, it gets multiplied by `max_children` and by the farm size.
+
+### Step 3 — Derive the WebGate profile
+
+```
+Max Connections    = conn_per_server × number_of_primaries     (primaries only!)
+Failover Threshold = conn_per_server        (if secondaries exist; otherwise 1, inert)
+AAA Timeout        = 5 seconds               (never -1)
+```
+
+### Step 4 — Project the load and sanity-check it
+
+Now multiply everything out:
+
+```
+per web server (worst case) = Max Connections × max_children
+farm total                  = per_web_server × number_of_web_servers
+per Access Server           = conn_per_server × max_children × number_of_web_servers
+```
+
+The last number is the one that matters: it is how many OAP connections **each Access Server** must sustain when every Apache in the farm is at full load. The script warns above 300 per Access Server and flags above 800 as critical (indicative thresholds, tunable at the top of the file via `WARN_CONN_PER_AS` / `CRIT_CONN_PER_AS` — the final word always belongs to a load test).
+
+### Worked example
+
+Using the file in `examples/httpd.conf.sample`:
 
 ```apache
 <IfModule mpm_worker_module>
@@ -69,60 +87,61 @@ Con il file di esempio in `examples/httpd.conf.sample`:
 </IfModule>
 ```
 
-e una farm di **5 web server** davanti a **8 Access Server** tutti primari:
+with a farm of **5 web servers** in front of **8 Access Servers**, all primary:
 
-```
-child_max            = min(8000 / 250, 32)      = 32
-Max Connections      = 1 × 8                     = 8
-conn_per_webserver   = 8 × 32                    = 256
-conn_totali_farm     = 256 × 5                   = 1280
-conn_per_AS          = 1 × 32 × 5                = 160
-```
+| Step | Computation | Result |
+|---|---|---|
+| 1. Max children | min(8000 / 250, 32) | **32** |
+| 2. Per-server connections | chosen default | **1** |
+| 3. Max Connections | 1 × 8 primaries | **8** |
+| 4a. Per web server | 8 × 32 children | **256** |
+| 4b. Farm total | 256 × 5 web servers | **1280** |
+| 4c. Per Access Server | 1 × 32 × 5 | **160** |
 
-Risultato: profilo WebGate con *Max Number of Connections = 1* su ciascuno degli 8 Access Server, *Max Connections = 8*, *AAA Timeout = 5s*; ogni Access Server riceverà al massimo **160 connessioni OAP** dall'intera farm — un carico sano e perfettamente simmetrico. Per riprodurlo:
+Bottom line: WebGate profile with *Max Number of Connections = 1* on each of the 8 Access Servers, *Max Connections = 8*, *AAA Timeout = 5s*; each Access Server will receive at most **160 OAP connections** from the whole farm — a healthy, perfectly symmetric load. Reproduce it with:
 
 ```bash
 python3 webgate_tuning.py --conf examples/httpd.conf.sample --webservers 5 --oam-primary 8
 ```
 
-## Utilizzo
+## Usage
 
-Tre modalità, combinabili:
+Three modes, combinable:
 
 ```bash
-# 1) Interattiva: chiede tutto con default sensati
+# 1) Interactive: prompts for everything with sensible defaults
 python3 webgate_tuning.py
 
-# 2) Da httpd.conf: legge il blocco MPM dal file
+# 2) From httpd.conf: reads the MPM block from the file
 python3 webgate_tuning.py --conf /etc/httpd/conf/httpd.conf --webservers 5 --oam-primary 8
 
-# 3) Tutto da CLI (i parametri espliciti vincono sempre sul file)
+# 3) Fully from the CLI (explicit parameters always win over the file)
 python3 webgate_tuning.py --maxclients 8000 --threadsperchild 250 --serverlimit 32 \
     --startservers 2 --webservers 5 --oam-primary 8 --oam-secondary 0 --conn-per-oam 1
 ```
 
-Parametri principali:
+Main options:
 
-| Opzione | Significato |
+| Option | Meaning |
 |---|---|
-| `--conf FILE` | Legge le direttive MPM da un httpd.conf (worker o event, nomi 2.2 e 2.4) |
-| `--webservers N` | Numero di web server nella farm |
-| `--oam-primary N` | Access Server primari |
-| `--oam-secondary N` | Access Server secondari (attiva la regola sul Failover Threshold) |
-| `--conn-per-oam N` | Max Number of Connections per singolo Access Server (default 1) |
+| `--conf FILE` | Read MPM directives from an httpd.conf (worker or event, 2.2 and 2.4 names) |
+| `--webservers N` | Number of web servers in the farm |
+| `--oam-primary N` | Primary Access Servers |
+| `--oam-secondary N` | Secondary Access Servers (activates the Failover Threshold rule) |
+| `--conn-per-oam N` | Max Number of Connections per single Access Server (default 1) |
 
-Oltre al calcolo, lo script **valida la coerenza del blocco MPM**: ServerLimit che strozza MaxClients, ThreadLimit inferiore a ThreadsPerChild (Apache lo abbasserebbe silenziosamente), MaxSpareThreads sotto il minimo `MinSpareThreads + ThreadsPerChild` (Apache lo correggerebbe a runtime), e la rigidità ThreadLimit == ThreadsPerChild (che impedisce di scalare i thread senza stop/start completo).
+Besides the math, the script **validates the MPM block itself**: ServerLimit choking MaxClients, ThreadLimit lower than ThreadsPerChild (Apache would silently lower it), MaxSpareThreads below the `MinSpareThreads + ThreadsPerChild` floor (Apache would correct it at runtime), and the ThreadLimit == ThreadsPerChild rigidity (which prevents scaling threads without a full stop/start).
 
-## Limiti noti
+## Known limitations
 
-Il parser di `--conf` non risolve le direttive `Include`: se la configurazione è splittata su più file (es. `mods-enabled/mpm_worker.conf` su Debian/Ubuntu), passare direttamente il file che contiene il blocco MPM. Le soglie di allarme sono indicative: la capacità reale di un Access Server dipende da hardware e tuning del managed server, quindi ogni configurazione va validata con un load test monitorando le connessioni sulla porta OAP (default 5575), ad esempio con `ss -tan | grep 5575`.
+The `--conf` parser does not resolve `Include` directives: if your configuration is split across files (e.g. `mods-enabled/mpm_worker.conf` on Debian/Ubuntu), pass the file containing the MPM block directly. The alert thresholds are indicative: the real capacity of an Access Server depends on hardware and managed-server tuning, so every configuration must be validated with a load test monitoring connections on the OAP port (default 5575), e.g. with `ss -tan | grep 5575`.
 
-## Riferimenti
+## References
 
 - Oracle A-Team, *OAM 11g Webgate Tuning* — fusionsecurity.blogspot.com (2016)
-- Documentazione Apache HTTP Server: direttive MPM worker/event (`ServerLimit`, `ThreadsPerChild`, `MaxRequestWorkers`, `ThreadLimit`)
-- Documentazione Oracle Access Manager: registrazione WebGate e parametri del profilo agente
+- Apache HTTP Server documentation: worker/event MPM directives (`ServerLimit`, `ThreadsPerChild`, `MaxRequestWorkers`, `ThreadLimit`)
+- Oracle Access Manager documentation: WebGate registration and agent profile parameters
 
-## Licenza
+## License
 
-MIT — vedi [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
