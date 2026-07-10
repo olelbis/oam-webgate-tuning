@@ -1,0 +1,14 @@
+# Sample httpd.conf
+ServerRoot "/etc/httpd"
+Listen 80
+
+<IfModule mpm_worker_module>
+        StartServers 2
+        ThreadLimit 250
+        ServerLimit 32
+        MaxClients 8000
+        MinSpareThreads 30
+        MaxSpareThreads 280
+        ThreadsPerChild 250
+        MaxRequestsPerChild 150000
+</IfModule>
