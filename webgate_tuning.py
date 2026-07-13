@@ -18,6 +18,9 @@ Non-interactive usage:
 
 Read the MPM block straight from httpd.conf:
   python3 webgate_tuning.py --conf /etc/httpd/conf/httpd.conf --webservers 5 --oam-primary 8
+
+If the configuration contains both worker and event blocks, specify the active one:
+  python3 webgate_tuning.py --conf /etc/httpd/conf/httpd.conf --mpm event --webservers 5 --oam-primary 8
 """
 
 import argparse
@@ -43,7 +46,7 @@ _DIRECTIVE_MAP = {
 }
 
 _MPM_BLOCK_RE = re.compile(
-    r"<IfModule\s+(?:!?)?(mpm_(worker|event)_module|mpm_(worker|event)\.c)\s*>(.*?)</IfModule>",
+    r"<IfModule\s+(?P<negated>!)?(?:mpm_(?P<name>worker|event)_module|mpm_(?P<legacy_name>worker|event)\.c)\s*>(?P<body>.*?)</IfModule>",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -63,12 +66,14 @@ def ask_int(prompt, default):
             print("  Invalid value, please enter an integer.")
 
 
-def parse_httpd_conf(path):
+def parse_httpd_conf(path, selected_mpm=None):
     """Extract MPM directives from an httpd.conf.
 
     Looks for an <IfModule mpm_worker_module|mpm_event_module> block first; if
     none is found, falls back to directives at the global level of the file.
-    Commented lines (#) are ignored. Returns (directives dict, mpm_name | None).
+    Commented lines (#) are ignored. If both worker and event blocks are
+    present, ``selected_mpm`` must explicitly select one. Returns (directives
+    dict, mpm_name | None).
     """
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         text = f.read()
@@ -87,18 +92,29 @@ def parse_httpd_conf(path):
                 found[_DIRECTIVE_MAP[key]] = int(m.group(2))
         return found
 
-    blocks = _MPM_BLOCK_RE.findall(text)
+    blocks = [match for match in _MPM_BLOCK_RE.finditer(text) if not match.group("negated")]
     if blocks:
-        # If multiple blocks exist (worker and event), merge them: the last one
-        # wins, but report the name of the first MPM found.
+        mpm_names = {((match.group("name") or match.group("legacy_name")).lower()) for match in blocks}
+        if len(mpm_names) > 1 and selected_mpm is None:
+            choices = ", ".join(sorted(mpm_names))
+            raise ValueError(
+                f"both worker and event MPM blocks were found ({choices}); "
+                "choose the active MPM explicitly with --mpm worker or --mpm event"
+            )
+        if selected_mpm is not None:
+            blocks = [
+                match for match in blocks
+                if (match.group("name") or match.group("legacy_name")).lower() == selected_mpm
+            ]
+            if not blocks:
+                raise ValueError(f"no mpm_{selected_mpm}_module block found in '{path}'")
+
+        # Multiple blocks for the same MPM are applied in file order by Apache,
+        # so later directives override earlier ones.
         merged = {}
-        mpm_name = None
-        for b in blocks:
-            body = b[3]
-            name = (b[1] or b[2] or "").lower() or "worker/event"
-            vals = scan(body)
-            if vals and mpm_name is None:
-                mpm_name = name
+        mpm_name = (blocks[0].group("name") or blocks[0].group("legacy_name")).lower()
+        for match in blocks:
+            vals = scan(match.group("body"))
             merged.update(vals)
         if merged:
             return merged, mpm_name
@@ -109,7 +125,9 @@ def parse_httpd_conf(path):
 
 def apply_conf_file(a):
     try:
-        values, mpm = parse_httpd_conf(a.conf)
+        values, mpm = parse_httpd_conf(a.conf, a.mpm)
+    except ValueError as e:
+        sys.exit(f"Error: {e}")
     except OSError as e:
         sys.exit(f"Error: cannot read '{a.conf}': {e}")
     if not values:
@@ -137,6 +155,8 @@ def parse_args():
     p.add_argument("--conf", type=str, metavar="HTTPD_CONF",
                    help="Path to httpd.conf: MPM directives are read from the file "
                         "(explicit CLI parameters still take precedence)")
+    p.add_argument("--mpm", choices=("worker", "event"),
+                   help="Active MPM to read when --conf contains both worker and event blocks")
     p.add_argument("--maxclients", type=int, help="MaxClients / MaxRequestWorkers")
     p.add_argument("--threadsperchild", type=int, help="ThreadsPerChild")
     p.add_argument("--serverlimit", type=int, help="ServerLimit")
@@ -180,6 +200,31 @@ def line(char="-", n=72):
     print(char * n)
 
 
+def validate_inputs(a):
+    positive = {
+        "MaxClients / MaxRequestWorkers": a.maxclients,
+        "ThreadsPerChild": a.threadsperchild,
+        "ServerLimit": a.serverlimit,
+        "ThreadLimit": a.threadlimit,
+        "StartServers": a.startservers,
+        "web servers": a.webservers,
+        "primary Access Servers": a.oam_primary,
+        "Max Number of Connections per Access Server": a.conn_per_oam,
+    }
+    invalid = [name for name, value in positive.items() if value is None or value <= 0]
+    if invalid:
+        sys.exit("Error: the following values must be > 0: " + ", ".join(invalid) + ".")
+
+    optional_nonnegative = {
+        "secondary Access Servers": a.oam_secondary,
+        "MinSpareThreads": a.minsparethreads,
+        "MaxSpareThreads": a.maxsparethreads,
+    }
+    invalid = [name for name, value in optional_nonnegative.items() if value is not None and value < 0]
+    if invalid:
+        sys.exit("Error: the following values must be >= 0: " + ", ".join(invalid) + ".")
+
+
 def main():
     a = parse_args()
     if a.conf:
@@ -192,8 +237,7 @@ def main():
     if a.startservers is None:
         a.startservers = 2
 
-    if a.threadsperchild <= 0 or a.maxclients <= 0:
-        sys.exit("Error: MaxClients and ThreadsPerChild must be > 0.")
+    validate_inputs(a)
 
     # ---- Apache derivations -------------------------------------------------
     child_by_maxclients = a.maxclients // a.threadsperchild

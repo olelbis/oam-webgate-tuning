@@ -8,6 +8,14 @@ Given the MPM block of your web server and your topology (number of web servers 
 python3 webgate_tuning.py --conf /etc/httpd/conf/httpd.conf --webservers 5 --oam-primary 8
 ```
 
+If the file contains both `worker` and `event` MPM blocks, explicitly select
+the MPM that is active at runtime:
+
+```bash
+python3 webgate_tuning.py --conf /etc/httpd/conf/httpd.conf --mpm event \
+    --webservers 5 --oam-primary 8
+```
+
 No dependencies: Python 3 standard library only.
 
 ## Where the calculation comes from
@@ -125,6 +133,7 @@ Main options:
 | Option | Meaning |
 |---|---|
 | `--conf FILE` | Read MPM directives from an httpd.conf (worker or event, 2.2 and 2.4 names) |
+| `--mpm worker\|event` | Required when `--conf` contains both MPM blocks; selects the active block |
 | `--webservers N` | Number of web servers in the farm |
 | `--oam-primary N` | Primary Access Servers |
 | `--oam-secondary N` | Secondary Access Servers (activates the Failover Threshold rule) |
