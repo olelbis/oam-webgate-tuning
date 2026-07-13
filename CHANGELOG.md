@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-07-13
+
+### Fixed
+- Require an explicit `--mpm worker` or `--mpm event` selection when both
+  worker and event MPM blocks are present in the parsed Apache configuration.
+- Parse only the selected active MPM block when `--mpm` is provided, avoiding
+  mixed values from multiple MPM configurations.
+- Validate numeric inputs so invalid zero or negative topology and MPM values
+  fail before calculations are performed.
+
 ## [1.0.0] - 2026-07-10
 
 ### Added
@@ -35,4 +45,5 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   "OAM 11g Webgate Tuning") and a step-by-step, foolproof walkthrough of how
   the final result is obtained.
 
+[1.0.1]: https://github.com/olelbis/oam-webgate-tuning/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/olelbis/oam-webgate-tuning/releases/tag/v1.0.0
